@@ -1,0 +1,30 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'nodomain.freeyourgadget.gadgetbridge.zeekr'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'nodomain.freeyourgadget.gadgetbridge.zeekr'
+        minSdk 31
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+    }
+}
+
+// No Gadgetbridge, AndroidX, wearable, camera, notification-listener or storage libraries.
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+    testImplementation 'org.mockito:mockito-core:5.14.2'
+}

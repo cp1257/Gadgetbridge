@@ -39,6 +39,7 @@ import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 
 import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
@@ -62,13 +63,21 @@ public class BLEScanService extends Service {
     public static final String COMMAND_STOP_SCAN_ALL = "nodomain.freeyourgadget.gadgetbridge.service.ble.scan.command.STOP_SCAN_ALL";
 
     public static final String EVENT_DEVICE_FOUND = "nodomain.freeyourgadget.gadgetbridge.service.ble.scan.event.DEVICE_FOUND";
+    public static final String ACTION_ZEEKR_NEAR = "nodomain.freeyourgadget.gadgetbridge.ZEEKR_NEAR";
 
     public static final String EXTRA_DEVICE = "EXTRA_DEVICE";
+    public static final String EXTRA_DEVICE_NAME = "EXTRA_DEVICE_NAME";
     public static final String EXTRA_DEVICE_ADDRESS = "EXTRA_DEVICE_ADDRESS";
     public static final String EXTRA_RSSI = "EXTRA_RSSI";
 
-    // 5 minutes scan restart interval
-    private final int DELAY_SCAN_RESTART = 5 * 60 * 1000;
+    private static final long DELAY_SCAN_RESTART = 30_000L;
+    private static final long DELAY_SCAN_FAILURE_RETRY = 5_000L;
+    private static final String ZEEKR_DEVICE_NAME = "Zeekr862";
+    private final Handler scanHandler = new Handler(Looper.getMainLooper());
+    private boolean useDeviceFilters = true;
+    private final Runnable restartScanRunnable = () -> restartScan(useDeviceFilters);
+    private boolean destroyed;
+    private boolean scanStartedBefore;
 
     private LocalBroadcastManager localBroadcastManager;
     private NotificationManager notificationManager;
@@ -98,9 +107,25 @@ public class BLEScanService extends Service {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
             super.onScanResult(callbackType, result);
+            if (destroyed) {
+                return;
+            }
             BluetoothDevice device = result.getDevice();
 
             LOG.debug("onScanResult: " + result);
+
+            // Use the advertised name, never the cached Bluetooth name or a fixed MAC.
+            if (result.getScanRecord() != null
+                    && ZEEKR_DEVICE_NAME.equals(result.getScanRecord().getDeviceName())) {
+                LOG.info("Zeekr found: {} RSSI={}", device.getAddress(), result.getRssi());
+                Intent nearIntent = new Intent(ACTION_ZEEKR_NEAR);
+                nearIntent.putExtra(EXTRA_DEVICE_NAME, ZEEKR_DEVICE_NAME);
+                nearIntent.putExtra(EXTRA_DEVICE_ADDRESS, device.getAddress());
+                nearIntent.putExtra(EXTRA_RSSI, result.getRssi());
+                sendBroadcast(nearIntent);
+                // Never forward the car to the device connection logic.
+                return;
+            }
 
             Intent intent = new Intent(EVENT_DEVICE_FOUND);
             intent.putExtra(EXTRA_DEVICE_ADDRESS, device.getAddress());
@@ -116,12 +141,23 @@ public class BLEScanService extends Service {
         }
 
         @Override
+        public void onBatchScanResults(List<ScanResult> results) {
+            for (ScanResult result : results) {
+                onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, result);
+            }
+        }
+
+        @Override
         public void onScanFailed(int errorCode) {
             super.onScanFailed(errorCode);
+            if (destroyed) {
+                return;
+            }
 
-            LOG.error("onScanFailed: " + errorCode);
+            LOG.error("Zeekr scan failed: {}", errorCode);
 
             updateNotification(getString(R.string.error_scan_failed, errorCode));
+            scheduleRestartScan(DELAY_SCAN_FAILURE_RETRY);
         }
     };
 
@@ -130,7 +166,6 @@ public class BLEScanService extends Service {
         super.onCreate();
 
         bluetoothManager = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
-        scanner = bluetoothManager.getAdapter().getBluetoothLeScanner();
 
         localBroadcastManager = LocalBroadcastManager.getInstance(this);
 
@@ -140,37 +175,23 @@ public class BLEScanService extends Service {
 
         this.startForeground();
 
-        if (scanner == null) {
-            updateNotification(getString(R.string.waiting_for_bluetooth));
-        } else {
-            restartScan(true);
-        }
-
-        // schedule after 5 seconds to fix weird timing of both services
-        scheduleRestartScan(5000);
-    }
-
-    private void scheduleRestartScan() {
-        scheduleRestartScan(DELAY_SCAN_RESTART);
+        restartScan(true);
     }
 
     private void scheduleRestartScan(long millis) {
-        Handler handler = new Handler();
-        handler.postDelayed(() -> {
-            LOG.debug("restarting scan...");
-            try {
-                restartScan(true);
-            } catch (Exception e) {
-                LOG.error("error during scheduled scan restart", e);
-            }
-            scheduleRestartScan();
-        }, millis);
+        scanHandler.removeCallbacks(restartScanRunnable);
+        if (!destroyed) {
+            scanHandler.postDelayed(restartScanRunnable, millis);
+        }
     }
 
     @Override
     public void onDestroy() {
-        super.onDestroy();
+        destroyed = true;
+        scanHandler.removeCallbacks(restartScanRunnable);
+        stopScanning();
         unregisterReceivers();
+        super.onDestroy();
     }
 
     private void updateNotification(boolean isScanning, int scannedDeviceCount) {
@@ -279,15 +300,9 @@ public class BLEScanService extends Service {
             }
             if (GBApplication.ACTION_QUIT.equals(intent.getAction())) {
                 LOG.debug("stopping scan service...");
-                if (currentState.isDoingAnyScan()) {
-                    if (ActivityCompat.checkSelfPermission(getApplicationContext(), Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-                        // this should never happen
-                        LOG.error("No BLUETOOTH_SCAN permission");
-                        return;
-                    }
-
-                    scanner.stopScan(scanCallback);
-                }
+                destroyed = true;
+                scanHandler.removeCallbacks(restartScanRunnable);
+                stopScanning();
                 stopSelf();
             }
         }
@@ -303,10 +318,12 @@ public class BLEScanService extends Service {
             switch (state) {
                 case BluetoothAdapter.STATE_OFF:
                 case BluetoothAdapter.STATE_TURNING_OFF:
+                    stopScanning();
+                    scanner = null;
                     updateNotification(getString(R.string.waiting_for_bluetooth));
                     break;
                 case BluetoothAdapter.STATE_ON:
-                    restartScan(true);
+                    restartScan(useDeviceFilters);
                     break;
             }
         }
@@ -344,8 +361,37 @@ public class BLEScanService extends Service {
         return ActivityCompat.checkSelfPermission(getApplicationContext(), Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED;
     }
 
-    @SuppressLint("MissingPermission") // linter does not recognize the usage of hasBluetoothPermission
     private void restartScan(boolean applyFilters) {
+        if (destroyed) {
+            return;
+        }
+        useDeviceFilters = applyFilters;
+        // One timer and one callback for the entire service lifetime.
+        scheduleRestartScan(DELAY_SCAN_RESTART);
+        try {
+            startScan(applyFilters);
+        } catch (RuntimeException e) {
+            LOG.error("Zeekr scan failed to start", e);
+            scheduleRestartScan(DELAY_SCAN_FAILURE_RETRY);
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void stopScanning() {
+        if (scanner != null) {
+            try {
+                scanner.stopScan(scanCallback);
+            } catch (IllegalStateException | SecurityException e) {
+                // Bluetooth may have been disabled or permissions revoked mid-scan.
+                LOG.warn("Unable to stop Zeekr scan", e);
+            }
+        }
+        currentState = ScanningState.NOT_SCANNING;
+    }
+
+    @SuppressLint("MissingPermission") // linter does not recognize the usage of hasBluetoothPermission
+    private void startScan(boolean applyFilters) {
+        stopScanning();
         if (!hasBluetoothPermission()) {
             // this should never happen
             LOG.error("No BLUETOOTH_SCAN permission");
@@ -353,23 +399,18 @@ public class BLEScanService extends Service {
             return;
         }
 
-        if (scanner == null) {
-            scanner = bluetoothManager.getAdapter().getBluetoothLeScanner();
-        }
-        if (scanner == null) {
-            // at this point we should already be waiting for bluetooth to turn back on
-            LOG.debug("cannot enable scan since bluetooth seems off (scanner == null)");
+        BluetoothAdapter adapter = bluetoothManager == null ? null : bluetoothManager.getAdapter();
+        if (adapter == null || adapter.getState() != BluetoothAdapter.STATE_ON) {
+            scanner = null;
+            updateNotification(getString(R.string.waiting_for_bluetooth));
             return;
         }
-        if (bluetoothManager.getAdapter().getState() != BluetoothAdapter.STATE_ON) {
-            // again, we should be waiting for the adapter to turn on again
-            LOG.debug("Bluetooth adapter state off");
-            return;
+        if (scanner == null) {
+            scanner = adapter.getBluetoothLeScanner();
         }
-        if (currentState.isDoingAnyScan()) {
-            if (hasBluetoothPermission()) {
-                scanner.stopScan(scanCallback);
-            }
+        if (scanner == null) {
+            updateNotification(getString(R.string.waiting_for_bluetooth));
+            return;
         }
         ArrayList<ScanFilter> scanFilters = null;
 
@@ -387,17 +428,17 @@ public class BLEScanService extends Service {
                 }
             }
 
-            if (scanFilters.isEmpty()) {
-                // no need to start scanning
-                LOG.debug("restartScan: stopping BLE scan, no devices");
-                currentState = ScanningState.NOT_SCANNING;
-                updateNotification(false, 0);
-                return;
-            }
+            // Filters are OR'ed: keep watching the car even without saved devices.
+            scanFilters.add(new ScanFilter.Builder()
+                    .setDeviceName(ZEEKR_DEVICE_NAME)
+                    .build());
         }
 
         final ScanSettings.Builder scanSettingsBuilder = new ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER); // enforced anyway in background
+                // Android may reduce this in the background; use a real name filter
+                // so the normal filtered scan can continue with the screen off.
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setReportDelay(0);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             scanSettingsBuilder
@@ -410,6 +451,8 @@ public class BLEScanService extends Service {
         }
 
         scanner.startScan(scanFilters, scanSettingsBuilder.build(), scanCallback);
+        LOG.info(scanStartedBefore ? "Zeekr scan restarted" : "Zeekr scan started");
+        scanStartedBefore = true;
         if (applyFilters) {
             LOG.debug("restartScan: started scan for " + scanFilters.size() + " devices");
             updateNotification(true, scanFilters.size());

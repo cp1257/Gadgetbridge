@@ -1,0 +1,56 @@
+name: Build Zeekr APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/build-zeekr-apk.yml'
+      - '.github/zeekr-dependencies.gradle'
+      - 'app/src/main/java/nodomain/freeyourgadget/gadgetbridge/service/btle/BLEScanService.java'
+      - 'app/src/test/java/nodomain/freeyourgadget/gadgetbridge/service/btle/BLEScanServiceTest.java'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android SDK 34
+        run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0'
+      - name: Check out pinned greenDAO generator
+        uses: actions/checkout@v4
+        with:
+          repository: Freeyourgadget/greenDAO
+          ref: 1998d7cd2d21f662c6044f6ccf3b3a251bbad341
+          path: .build-tools/greendao/greenDAO-1998d7cd2d21f662c6044f6ccf3b3a251bbad341
+          persist-credentials: false
+      - name: Build installable debug APK and test Zeekr scanning
+        run: |
+          chmod +x gradlew
+          ./gradlew -I .github/zeekr-dependencies.gradle :app:assembleMainlineDebug :app:testMainlineDebugUnitTest --tests nodomain.freeyourgadget.gadgetbridge.service.btle.BLEScanServiceTest --no-daemon --console=plain
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gadgetbridge-zeekr-debug-apk
+          path: app/build/outputs/apk/mainline/debug/app-mainline-debug.apk
+          if-no-files-found: error
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeekr-scan-test-reports
+          path: app/build/reports/tests/testMainlineDebugUnitTest/
+          if-no-files-found: ignore

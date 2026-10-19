@@ -1,0 +1,13 @@
+// Build the original pinned generator sources: its old JitPack artifact is unavailable.
+// The workflow checks out this exact commit; no generated database code is changed.
+gradle.projectsEvaluated {
+    def generator = gradle.rootProject.project(':GBDaoGenerator')
+    generator.configurations.implementation.dependencies.removeAll {
+        it.group == 'com.github.Freeyourgadget' && it.name == 'greendao'
+    }
+    def sources = new File(gradle.rootProject.projectDir,
+            '.build-tools/greendao/greenDAO-1998d7cd2d21f662c6044f6ccf3b3a251bbad341/DaoGenerator')
+    generator.sourceSets.main.java.srcDir(new File(sources, 'src'))
+    generator.sourceSets.main.resources.srcDir(new File(sources, 'src-template'))
+    generator.dependencies.add('implementation', 'org.freemarker:freemarker:2.3.23')
+}

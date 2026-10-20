@@ -43,25 +43,28 @@ and a fixed MAC are never used. Every matching result sends the public action
 
 The main filtered scan is continuous. There is no unconditional 30-second restart anymore.
 `PowerManager.isInteractive()` initializes the screen state when the foreground service starts;
-a dynamic, non-exported screen receiver handles SCREEN_ON/OFF. Screen-on cancels the diagnostic
-scan, pending health check and pending failure retry. Each new screen-off period starts a fresh
-five-minute grace period. Bluetooth-off pauses checks and does not count as a scanner timeout.
+a dynamic, non-exported screen receiver handles SCREEN_ON/OFF. The watchdog runs with either
+screen state: every 30 seconds it registers a five-second unfiltered diagnostic scan with its
+own stable callback alongside the continuous main scan. Screen transitions do not cancel checks,
+diagnostics or scan-failure recovery. Foreign devices are never stored or displayed.
 
-Only with the screen off, a five-second unfiltered diagnostic scan is requested every 60 seconds,
-using its own stable callback alongside the main filtered callback. It never stops the main scan
-and never stores or displays foreign devices. The first device per check produces the public
-action `nodomain.freeyourgadget.gadgetbridge.BLE_SCANNER_ALIVE` with address, RSSI and optional
-advertised name extras. A Zeekr diagnostic result also immediately produces ZEEKR_NEAR.
-`lastAnyBleSeen` and `lastZeekrSeen` are monotonic in-memory timestamps.
+The first device per check sends public action
+`nodomain.freeyourgadget.gadgetbridge.BLE_SCANNER_ALIVE` with address, RSSI and optional advertised
+name extras. Every diagnostic result updates `lastAnyBleSeen`; Zeekr results from either scan
+also update `lastZeekrSeen` and immediately send ZEEKR_NEAR, without debounce.
 
-After more than five minutes without any result during the current screen-off period, the
-watchdog stops both registrations, cancels pending work, reacquires the adapter/scanner and
-starts the main scan again. Watchdog restarts are at least 120 seconds apart. Scan failures
-request a five-second retry only while the screen is off (subject to that restart cooldown).
-No aggressive retries run while the screen is on. Bluetooth ON always restores the main scan.
+After more than 60 seconds without any BLE result, a completed diagnostic triggers a timeout.
+With the screen on it only logs suppression; with the screen off it stops both registrations,
+cancels pending work, reacquires the adapter/scanner and restarts the main scan. SCREEN_OFF
+evaluates an already overdue timeout immediately, without a new grace period. Actual interactive
+power state is rechecked before timeout recovery. Restarts have a shared 60-second cooldown.
+Main scan failures request recovery after five seconds with either screen state, subject to
+the cooldown. Diagnostic failures only stop the diagnostic and await the next cycle.
+Bluetooth OFF pauses scanning without a restart loop; ON restores the main scan, resets the
+monitoring baseline and resumes checks.
 
-Each watchdog restart sends `nodomain.freeyourgadget.gadgetbridge.BLE_SCANNER_RESTART` with:
-- `EXTRA_RESTART_REASON`: `no_ble_results`, `scan_failed`, `main_scan_inactive`, or `scanner_unavailable`.
+Each restart sends `nodomain.freeyourgadget.gadgetbridge.BLE_SCANNER_RESTART` with:
+- `EXTRA_RESTART_REASON`: `watchdog_timeout`, `scan_failed`, or `bluetooth_reenabled`.
 - `EXTRA_TIMESTAMP`: Unix timestamp in milliseconds (long).
 - `EXTRA_ERROR_CODE`: Android scan error code (int), only when available.
 

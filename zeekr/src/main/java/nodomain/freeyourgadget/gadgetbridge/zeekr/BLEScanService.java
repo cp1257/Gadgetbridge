@@ -255,7 +255,10 @@ public class BLEScanService extends Service {
     }
 
     private boolean watchdogEnabled() {
-        return screenOff && !destroyed && !bluetoothOff;
+        // A queued timer can run just before SCREEN_ON is delivered. Recheck the
+        // actual power state so it cannot diagnose/restart an already interactive phone.
+        return screenOff && !destroyed && !bluetoothOff
+                && !getSystemService(PowerManager.class).isInteractive();
     }
 
     private void scheduleCheck() {
@@ -336,7 +339,11 @@ public class BLEScanService extends Service {
     }
 
     private void finishDiagnostic() {
-        if (!watchdogEnabled() || !diagnosticActive) {
+        if (!watchdogEnabled()) {
+            stopDiagnostic();
+            return;
+        }
+        if (!diagnosticActive) {
             return;
         }
         boolean sawDevice = diagnosticSawDevice;

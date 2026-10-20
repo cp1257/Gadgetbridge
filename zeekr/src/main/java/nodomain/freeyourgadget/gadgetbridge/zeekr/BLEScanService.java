@@ -45,10 +45,10 @@ public class BLEScanService extends Service {
     private static final String CHANNEL = "zeekr_scan";
     private static final int NOTIFICATION_ID = 1;
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private static final long CHECK_INTERVAL = 60_000;
+    private static final long CHECK_INTERVAL = 30_000;
     private static final long DIAGNOSTIC_DURATION = 5_000;
-    private static final long NO_RESULTS_TIMEOUT = 300_000;
-    private static final long RESTART_COOLDOWN = 120_000;
+    private static final long NO_RESULTS_TIMEOUT = 60_000;
+    private static final long RESTART_COOLDOWN = 60_000;
     private final Runnable watchdogCheck = this::checkScanner;
     private final Runnable diagnosticEnd = this::finishDiagnostic;
     private BluetoothManager bluetoothManager;
@@ -61,7 +61,7 @@ public class BLEScanService extends Service {
     private boolean mainScanStarted;
     private boolean diagnosticActive;
     private boolean diagnosticSawDevice;
-    private long screenOffSince;
+    private long scanMonitoringSince = SystemClock.elapsedRealtime();
     private long lastAnyBleSeen = -1;
     private long lastZeekrSeen = -1;
     private long lastWatchdogRestart = -RESTART_COOLDOWN;
@@ -104,7 +104,7 @@ public class BLEScanService extends Service {
     private final ScanCallback diagnosticCallback = new ScanCallback() {
         @Override
         public void onScanResult(int type, ScanResult result) {
-            if (destroyed || !screenOff || !diagnosticActive) {
+            if (destroyed || !diagnosticActive) {
                 return;
             }
             lastAnyBleSeen = SystemClock.elapsedRealtime();
@@ -134,7 +134,8 @@ public class BLEScanService extends Service {
         public void onScanFailed(int code) {
             if (diagnosticActive) {
                 stopDiagnostic();
-                scanFailed(code);
+                Log.e(TAG, "BLE scan failed: " + code);
+                scheduleCheck();
             }
         }
     };
@@ -162,13 +163,17 @@ public class BLEScanService extends Service {
                 cancelWatchdog();
                 stopMainScan();
                 scanner = null;
-                screenOffSince = SystemClock.elapsedRealtime();
+                scanMonitoringSince = SystemClock.elapsedRealtime();
                 startZeekrScan();
-                if (screenOff) {
-                    scheduleCheck();
+                if (mainScanStarted) {
+                    Log.i(TAG, "Bluetooth on: Zeekr scan restored");
+                    Log.i(TAG, "Zeekr scan restarted");
+                    sendRestartEvent("bluetooth_reenabled", null);
                 }
+                scheduleCheck();
             } else if (state == BluetoothAdapter.STATE_OFF || state == BluetoothAdapter.STATE_TURNING_OFF) {
                 bluetoothOff = true;
+                Log.i(TAG, "Bluetooth off: watchdog restart suppressed");
                 cancelWatchdog();
                 stopMainScan();
                 scanner = null;
@@ -225,6 +230,9 @@ public class BLEScanService extends Service {
             return START_NOT_STICKY;
         }
         startZeekrScan();
+        if (!handler.hasCallbacks(watchdogCheck)) {
+            scheduleCheck();
+        }
         return START_STICKY;
     }
 
@@ -233,18 +241,10 @@ public class BLEScanService extends Service {
             return;
         }
         screenOff = off;
-        cancelWatchdog();
+        Log.i(TAG, off ? "Screen off" : "Screen on");
+        // Screen transitions never reset result timestamps or interrupt diagnostics.
         if (off) {
-            screenOffSince = SystemClock.elapsedRealtime();
-            Log.i(TAG, "Screen off: BLE watchdog enabled");
-            if (!bluetoothOff) {
-                scheduleCheck();
-                if (!mainScanStarted && lastErrorCode != null) {
-                    scheduleFailureRetry();
-                }
-            }
-        } else {
-            Log.i(TAG, "Screen on: BLE watchdog paused");
+            evaluateTimeout();
         }
     }
 
@@ -255,10 +255,7 @@ public class BLEScanService extends Service {
     }
 
     private boolean watchdogEnabled() {
-        // A queued timer can run just before SCREEN_ON is delivered. Recheck the
-        // actual power state so it cannot diagnose/restart an already interactive phone.
-        return screenOff && !destroyed && !bluetoothOff
-                && !getSystemService(PowerManager.class).isInteractive();
+        return !destroyed && !bluetoothOff;
     }
 
     private void scheduleCheck() {
@@ -287,7 +284,10 @@ public class BLEScanService extends Service {
     }
 
     private void scheduleFailureRetry() {
-        handler.removeCallbacks(failureRetry);
+        // Health checks must not postpone an already scheduled recovery.
+        if (handler.hasCallbacks(failureRetry)) {
+            return;
+        }
         if (watchdogEnabled()) {
             long cooldownLeft = RESTART_COOLDOWN - (SystemClock.elapsedRealtime() - lastWatchdogRestart);
             handler.postDelayed(failureRetry, Math.max(5000, cooldownLeft));
@@ -308,18 +308,20 @@ public class BLEScanService extends Service {
         try {
             if (!bluetoothEnabled()) {
                 // Powered-off Bluetooth and time spent waiting for it are not a scanner timeout.
-                screenOffSince = SystemClock.elapsedRealtime();
+                Log.i(TAG, "Bluetooth off: watchdog restart suppressed");
                 return;
             }
             if (scanner == null) {
-                watchdogRestart("scanner_unavailable", lastErrorCode);
+                scheduleFailureRetry();
                 return;
             }
             if (!mainScanStarted) {
-                watchdogRestart("main_scan_inactive", lastErrorCode);
+                scheduleFailureRetry();
                 return;
             }
-            stopDiagnostic();
+            if (diagnosticActive) {
+                return;
+            }
             diagnosticSawDevice = false;
             diagnosticActive = true;
             Log.i(TAG, "BLE watchdog check started");
@@ -332,9 +334,7 @@ public class BLEScanService extends Service {
         } catch (RuntimeException e) {
             stopDiagnostic();
             Log.e(TAG, "BLE watchdog diagnostic failed", e);
-            if (watchdogEnabled()) {
-                scheduleFailureRetry();
-            }
+            // A diagnostic failure must not restart the healthy main registration.
         }
     }
 
@@ -351,14 +351,27 @@ public class BLEScanService extends Service {
         if (!sawDevice) {
             Log.i(TAG, "BLE watchdog no devices detected");
         }
-        if (SystemClock.elapsedRealtime() - Math.max(screenOffSince, lastAnyBleSeen) > NO_RESULTS_TIMEOUT) {
-            Log.w(TAG, "BLE scanner watchdog timeout");
-            watchdogRestart("no_ble_results", null);
+        evaluateTimeout();
+    }
+
+    private void evaluateTimeout() {
+        if (!watchdogEnabled() || !bluetoothEnabled()
+                || SystemClock.elapsedRealtime() - Math.max(scanMonitoringSince, lastAnyBleSeen)
+                <= NO_RESULTS_TIMEOUT) {
+            return;
         }
+        // Check actual power state too: SCREEN_ON may still be queued for delivery.
+        if (!screenOff || getSystemService(PowerManager.class).isInteractive()) {
+            Log.w(TAG, "BLE watchdog timeout detected while screen on - restart suppressed");
+            return;
+        }
+        Log.w(TAG, "BLE scanner watchdog timeout");
+        watchdogRestart("watchdog_timeout", null);
     }
 
     private void watchdogRestart(String reason, Integer errorCode) {
-        if (!watchdogEnabled()) {
+        if (!watchdogEnabled() || ("watchdog_timeout".equals(reason)
+                && (!screenOff || getSystemService(PowerManager.class).isInteractive()))) {
             return;
         }
         try {
@@ -374,19 +387,26 @@ public class BLEScanService extends Service {
             stopMainScan();
             scanner = null; // startZeekrScan obtains the adapter and scanner again.
             Log.i(TAG, "BLE scanner watchdog restart");
-            Intent event = new Intent(ACTION_SCANNER_RESTART)
-                    .putExtra(EXTRA_RESTART_REASON, reason)
-                    .putExtra(EXTRA_TIMESTAMP, System.currentTimeMillis());
-            if (errorCode != null) {
-                event.putExtra(EXTRA_ERROR_CODE, errorCode.intValue());
-            }
-            sendBroadcast(event);
+            sendRestartEvent(reason, errorCode);
             startZeekrScan();
+            if (mainScanStarted) {
+                Log.i(TAG, "Zeekr scan restarted");
+            }
             scheduleCheck();
         } catch (RuntimeException e) {
             Log.e(TAG, "BLE watchdog restart failed", e);
             scheduleFailureRetry();
         }
+    }
+
+    private void sendRestartEvent(String reason, Integer errorCode) {
+        Intent event = new Intent(ACTION_SCANNER_RESTART)
+                .putExtra(EXTRA_RESTART_REASON, reason)
+                .putExtra(EXTRA_TIMESTAMP, System.currentTimeMillis());
+        if (errorCode != null) {
+            event.putExtra(EXTRA_ERROR_CODE, errorCode.intValue());
+        }
+        sendBroadcast(event);
     }
 
     @SuppressLint("MissingPermission")

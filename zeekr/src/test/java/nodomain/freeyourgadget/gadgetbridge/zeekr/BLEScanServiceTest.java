@@ -102,6 +102,8 @@ public class BLEScanServiceTest {
     }
 
     private void screen(boolean off) {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication().getSystemService(PowerManager.class))
+                .setIsInteractive(!off);
         BroadcastReceiver receiver = ReflectionHelpers.getField(service, "screenReceiver");
         receiver.onReceive(service, new Intent(off ? Intent.ACTION_SCREEN_OFF : Intent.ACTION_SCREEN_ON));
     }
@@ -376,6 +378,20 @@ public class BLEScanServiceTest {
         verifyNoInteractions(scanner);
         advance(1);
         verify(scanner).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
+    }
+
+    @Test
+    public void actualScreenOnBlocksQueuedRestartBeforeScreenOnBroadcastArrives() {
+        start();
+        screen(true);
+        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
+        advance(4);
+        Shadows.shadowOf(RuntimeEnvironment.getApplication().getSystemService(PowerManager.class))
+                .setIsInteractive(true);
+        clearInvocations(scanner);
+        advance(600);
+        verifyNoInteractions(scanner);
+        assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
     }
 
     @Test

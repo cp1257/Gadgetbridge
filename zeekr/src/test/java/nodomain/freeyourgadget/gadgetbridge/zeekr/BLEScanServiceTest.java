@@ -150,20 +150,19 @@ public class BLEScanServiceTest {
     }
 
     @Test
-    public void screenOnNeverRunsDiagnosticsTimeoutsOrFailureRestarts() {
+    public void screenOnRunsDiagnosticsButSuppressesTimeoutRestart() {
         start();
         start();
-        verify(scanner, times(1)).startScan(anyList(), any(ScanSettings.class), same(callback));
-        clearInvocations(scanner);
-        advance(7200);
-        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
-        advance(7200);
-        verifyNoInteractions(scanner);
+        advance(95);
+        verify(scanner, times(3)).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
+        verify(scanner, never()).stopScan(same(callback));
         assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
+        assertTrue(org.robolectric.shadows.ShadowLog.getLogsForTag("ZeekrBLE").stream()
+                .anyMatch(log -> log.msg.contains("timeout detected while screen on")));
     }
 
     @Test
-    public void failureRetriesOnlyScreenOffWithErrorExtrasAndCooldown() {
+    public void failureRetriesOnEitherScreenStateWithErrorExtrasAndCooldown() {
         start();
         screen(true);
         clearInvocations(scanner);
@@ -179,7 +178,7 @@ public class BLEScanServiceTest {
                 restart.getIntExtra(BLEScanService.EXTRA_ERROR_CODE, -1));
         assertTrue(restart.hasExtra(BLEScanService.EXTRA_TIMESTAMP));
         callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
-        advance(119);
+        advance(59);
         assertEquals(1, events(BLEScanService.ACTION_SCANNER_RESTART).size());
         advance(1);
         assertEquals(2, events(BLEScanService.ACTION_SCANNER_RESTART).size());
@@ -189,7 +188,7 @@ public class BLEScanServiceTest {
     public void destroyStopsBothScansCancelsTimersAndUnregistersBothReceivers() {
         start();
         screen(true);
-        advance(60);
+        advance(30);
         int before = Shadows.shadowOf(RuntimeEnvironment.getApplication()).getRegisteredReceivers().size();
         assertTrue(before >= 2);
         clearInvocations(scanner);
@@ -209,24 +208,27 @@ public class BLEScanServiceTest {
     }
 
     @Test
-    public void bluetoothOffIsNotATimeoutAndOnRestartsWithFreshScreenOffPeriod() {
+    public void bluetoothOffSuppressesTimeoutAndOnRestoresScanAndDiagnostics() {
         start();
         screen(true);
         BroadcastReceiver receiver = ReflectionHelpers.getField(service, "bluetoothReceiver");
-        clearInvocations(scanner);
         when(adapter.isEnabled()).thenReturn(false);
         receiver.onReceive(service, new Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
                 .putExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_OFF));
-        verify(scanner).stopScan(same(callback));
         clearInvocations(scanner);
         advance(3600);
         verifyNoInteractions(scanner);
+        assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
         when(adapter.isEnabled()).thenReturn(true);
         receiver.onReceive(service, new Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
                 .putExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_ON));
         verify(scanner).startScan(anyList(), any(ScanSettings.class), same(callback));
-        advance(65);
-        assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
+        assertEquals("bluetooth_reenabled", events(BLEScanService.ACTION_SCANNER_RESTART).get(0)
+                .getStringExtra(BLEScanService.EXTRA_RESTART_REASON));
+        advance(30);
+        diagnostic.onScanResult(1, advertisement("Other", "11:12:13:14:15:16", -70));
+        advance(5);
+        assertEquals(1, events(BLEScanService.ACTION_SCANNER_RESTART).size());
     }
 
     @Test
@@ -234,7 +236,7 @@ public class BLEScanServiceTest {
         start();
         screen(true);
         for (int i = 0; i < 8; i++) {
-            advance(i == 0 ? 60 : 55);
+            advance(i == 0 ? 30 : 25);
             diagnostic.onScanResult(1, advertisement("Other", "11:12:13:14:15:16", -70));
             advance(5);
         }
@@ -251,57 +253,51 @@ public class BLEScanServiceTest {
     }
 
     @Test
-    public void fiveMinutesSilenceCausesOneRestartThenAtLeastTwoMinuteCooldown() {
+    public void silenceRestartsAfterSixtySecondsAndObservesSixtySecondCooldown() {
         start();
         screen(true);
-        advance(304);
+        advance(64);
         assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
         advance(1);
         assertEquals(1, events(BLEScanService.ACTION_SCANNER_RESTART).size());
-        assertEquals("no_ble_results", events(BLEScanService.ACTION_SCANNER_RESTART).get(0)
+        assertEquals("watchdog_timeout", events(BLEScanService.ACTION_SCANNER_RESTART).get(0)
                 .getStringExtra(BLEScanService.EXTRA_RESTART_REASON));
-        advance(124);
+        advance(59);
         assertEquals(1, events(BLEScanService.ACTION_SCANNER_RESTART).size());
-        advance(1);
+        advance(6);
         assertEquals(2, events(BLEScanService.ACTION_SCANNER_RESTART).size());
         verify(adapter, atLeast(3)).getBluetoothLeScanner();
     }
 
     @Test
-    public void screenOnCancelsDiagnosticAndFailureRetryAndNextOffHasFreshDeadline() {
+    public void screenOnKeepsDiagnosticAndFailureRecoveryRunning() {
         start();
         screen(true);
-        advance(60);
-        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
+        advance(30);
         screen(false);
-        verify(scanner).stopScan(same(diagnostic));
-        clearInvocations(scanner);
+        verify(scanner, never()).stopScan(same(diagnostic));
         diagnostic.onScanResult(1, advertisement("Other", "11:12:13:14:15:16", -70));
-        advance(7200);
-        verifyNoInteractions(scanner);
-        assertTrue(events(BLEScanService.ACTION_SCANNER_ALIVE).isEmpty());
-        assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
-        // A healthy main scan, but no advertisements, must get a new full grace period.
-        ReflectionHelpers.setField(service, "mainScanStarted", true);
-        ReflectionHelpers.setField(service, "lastErrorCode", null);
-        screen(true);
-        advance(65);
-        assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
+        assertEquals(1, events(BLEScanService.ACTION_SCANNER_ALIVE).size());
+        advance(5);
+        verify(scanner).stopScan(same(diagnostic));
+        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
+        advance(5);
+        assertEquals(1, events(BLEScanService.ACTION_SCANNER_RESTART).size());
     }
 
     @Test
-    public void repeatedScreenTransitionsAndTwoHoursDoNotAccumulateDiagnosticCallbacks() {
+    public void repeatedTransitionsAndTwoHoursKeepOneDiagnosticAndContinuousMainScan() {
         start();
-        for (int i = 0; i < 120; i++) {
+        for (int i = 0; i < 240; i++) {
             screen(false);
             screen(true);
             screen(true);
-            advance(60);
+            advance(i == 0 ? 30 : 25);
             diagnostic.onScanResult(1, advertisement("Other", "11:12:13:14:15:16", -70));
             advance(5);
         }
-        verify(scanner, times(120)).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
-        verify(scanner, times(120)).stopScan(same(diagnostic));
+        verify(scanner, times(240)).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
+        verify(scanner, times(240)).stopScan(same(diagnostic));
         verify(scanner, times(1)).startScan(anyList(), any(ScanSettings.class), same(callback));
         assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
     }
@@ -310,10 +306,10 @@ public class BLEScanServiceTest {
     public void zeekrDuringDiagnosticStillBroadcastsAndUpdatesBothTimestamps() {
         start();
         screen(true);
-        advance(60);
+        advance(30);
         diagnostic.onScanResult(1, advertisement("Zeekr862", "11:12:13:14:15:16", -70));
         assertEquals(1, events().size());
-        assertTrue((long) ReflectionHelpers.getField(service, "lastZeekrSeen") >= 60000);
+        assertTrue((long) ReflectionHelpers.getField(service, "lastZeekrSeen") >= 30000);
         long zeekrSeen = ReflectionHelpers.getField(service, "lastZeekrSeen");
         long anySeen = ReflectionHelpers.getField(service, "lastAnyBleSeen");
         assertEquals(zeekrSeen, anySeen);
@@ -323,7 +319,7 @@ public class BLEScanServiceTest {
     public void unnamedAdvertisementsAlsoProveScannerAlive() {
         start();
         screen(true);
-        advance(60);
+        advance(30);
         diagnostic.onScanResult(1, new ScanResult(BluetoothAdapter.getDefaultAdapter()
                 .getRemoteDevice("11:12:13:14:15:16"), null, -72, 0));
         Intent alive = events(BLEScanService.ACTION_SCANNER_ALIVE).get(0);
@@ -333,32 +329,23 @@ public class BLEScanServiceTest {
     }
 
     @Test
-    public void diagnosticFailureDoesNotStopMainScanAndScreenOnCancelsRecovery() {
+    public void diagnosticFailureWaitsForNextCheckWithoutRestartingMain() {
         start();
-        screen(true);
-        advance(60);
+        advance(30);
         diagnostic.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
+        advance(5);
         verify(scanner, never()).stopScan(same(callback));
-        screen(false);
-        clearInvocations(scanner);
-        advance(600);
-        verifyNoInteractions(scanner);
         assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
+        advance(25);
+        verify(scanner, times(2)).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
     }
 
     @Test
-    public void screenOnJustBeforeTimeoutCancelsItAndNewOffPeriodStartsAtZero() {
+    public void screenOffAfterScreenOnTimeoutRestartsImmediatelyWithoutFreshGracePeriod() {
         start();
-        screen(true);
-        advance(304);
-        screen(false);
-        clearInvocations(scanner);
-        advance(3600);
-        verifyNoInteractions(scanner);
-        screen(true);
-        advance(304);
+        advance(95);
         assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
-        advance(1);
+        screen(true);
         assertEquals(1, events(BLEScanService.ACTION_SCANNER_RESTART).size());
     }
 
@@ -374,24 +361,42 @@ public class BLEScanServiceTest {
         assertTrue((boolean) ReflectionHelpers.getField(service, "screenOff"));
         start();
         clearInvocations(scanner);
-        advance(59);
+        advance(29);
         verifyNoInteractions(scanner);
         advance(1);
         verify(scanner).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
     }
 
     @Test
-    public void actualScreenOnBlocksQueuedRestartBeforeScreenOnBroadcastArrives() {
+    public void actualInteractiveStateSuppressesTimeoutBeforeScreenOnBroadcastArrives() {
         start();
         screen(true);
-        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
-        advance(4);
+        advance(64);
         Shadows.shadowOf(RuntimeEnvironment.getApplication().getSystemService(PowerManager.class))
                 .setIsInteractive(true);
-        clearInvocations(scanner);
-        advance(600);
-        verifyNoInteractions(scanner);
+        advance(1);
         assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
+        verify(scanner, times(2)).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
+    }
+
+    @Test
+    public void mainResultResetsHealthTimeoutWithoutDiagnosticResult() {
+        start();
+        screen(true);
+        advance(59);
+        callback.onScanResult(1, advertisement("Zeekr862", "11:12:13:14:15:16", -70));
+        advance(36);
+        assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
+        assertEquals(1, events().size());
+    }
+
+    @Test
+    public void mainFailureRecoversWhileScreenOn() {
+        start();
+        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
+        advance(5);
+        assertEquals(1, events(BLEScanService.ACTION_SCANNER_RESTART).size());
+        verify(scanner, times(2)).startScan(anyList(), any(ScanSettings.class), same(callback));
     }
 
     @Test

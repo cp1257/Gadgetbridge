@@ -41,13 +41,39 @@ and a fixed MAC are never used. Every matching result sends the public action
 `nodomain.freeyourgadget.gadgetbridge.ZEEKR_NEAR` with `EXTRA_DEVICE_NAME`,
 `EXTRA_DEVICE_ADDRESS` (current address), and integer `EXTRA_RSSI`. There is no debounce.
 
-One callback and one main-looper timer restart the scan approximately every 30 seconds,
-stopping the old scan before starting the new one. Failures retry after 5 seconds.
-Bluetooth OFF/ON is handled by a runtime receiver. Service destruction cancels the timer,
-stops scanning and unregisters the receiver. LOW_LATENCY, ALL_MATCHES and zero report delay
-are requested; Android may reduce the scan duty cycle or delay timers while the device sleeps.
-There is no wake lock or exact alarm. Force-stop and vendor battery restrictions are controlled
-by Android; real phone/vehicle testing remains necessary.
+The main filtered scan is continuous. There is no unconditional 30-second restart anymore.
+`PowerManager.isInteractive()` initializes the screen state when the foreground service starts;
+a dynamic, non-exported screen receiver handles SCREEN_ON/OFF. Screen-on cancels the diagnostic
+scan, pending health check and pending failure retry. Each new screen-off period starts a fresh
+five-minute grace period. Bluetooth-off pauses checks and does not count as a scanner timeout.
+
+Only with the screen off, a five-second unfiltered diagnostic scan is requested every 60 seconds,
+using its own stable callback alongside the main filtered callback. It never stops the main scan
+and never stores or displays foreign devices. The first device per check produces the public
+action `nodomain.freeyourgadget.gadgetbridge.BLE_SCANNER_ALIVE` with address, RSSI and optional
+advertised name extras. A Zeekr diagnostic result also immediately produces ZEEKR_NEAR.
+`lastAnyBleSeen` and `lastZeekrSeen` are monotonic in-memory timestamps.
+
+After more than five minutes without any result during the current screen-off period, the
+watchdog stops both registrations, cancels pending work, reacquires the adapter/scanner and
+starts the main scan again. Watchdog restarts are at least 120 seconds apart. Scan failures
+request a five-second retry only while the screen is off (subject to that restart cooldown).
+No aggressive retries run while the screen is on. Bluetooth ON always restores the main scan.
+
+Each watchdog restart sends `nodomain.freeyourgadget.gadgetbridge.BLE_SCANNER_RESTART` with:
+- `EXTRA_RESTART_REASON`: `no_ble_results`, `scan_failed`, `main_scan_inactive`, or `scanner_unavailable`.
+- `EXTRA_TIMESTAMP`: Unix timestamp in milliseconds (long).
+- `EXTRA_ERROR_CODE`: Android scan error code (int), only when available.
+
+Android explicitly suppresses unfiltered scanning with the screen off on some implementations.
+Consequently a missing diagnostic heartbeat can also mean OS suppression or an empty environment,
+not a proven scanner failure. Timeout recovery is intentionally a heuristic. The filtered main
+scan remains active throughout the diagnostic. No extra permissions, location, WakeLock or alarms
+are added. Handler checks can be delayed in deep sleep; no screen wakeup is requested. Real
+phone/vehicle testing, including vendor power-saving restrictions, remains necessary.
+
+Service destruction cancels every runnable, stops both scan registrations and unregisters both
+runtime receivers. LOW_LATENCY, ALL_MATCHES and zero report delay are requested for the main scan.
 
 `neverForLocation` can filter some BLE beacons on Android. Check Zeekr advertisements on the
 target phone; the app does not add location permissions as an unrequested fallback.
@@ -66,3 +92,4 @@ Android references:
 - https://developer.android.com/develop/connectivity/bluetooth/bt-permissions
 - https://developer.android.com/develop/ui/views/notifications/notification-permission
 - https://developer.android.com/develop/background-work/services/fgs/service-types#connected-device
+- https://developer.android.com/reference/android/bluetooth/le/BluetoothLeScanner

@@ -8,9 +8,6 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.provider.Settings;
-import android.view.View;
-import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -23,7 +20,7 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             status.setText(getSharedPreferences("zeekr", MODE_PRIVATE)
-                    .getString("status", "Сканирование остановлено"));
+                    .getString("status", "Обнаружение выполняется автоматически"));
             handler.postDelayed(this, 1000);
         }
     };
@@ -55,45 +52,27 @@ public class MainActivity extends Activity {
         status = new TextView(this);
         layout.addView(status);
         TextView description = new TextView(this);
-        description.setText("Обнаружение только по BLE-имени. При каждом обнаружении отправляется "
-                + "ZEEKR_NEAR для MacroDroid. Подключение к автомобилю не выполняется. "
-                + "После запуска экран приложения можно закрыть.");
+        description.setText("Обнаружение выполняется автоматически. "
+                + "При обнаружении Zeekr862 отправляется ZEEKR_NEAR для MacroDroid.");
         layout.addView(description);
-        button(layout, "Запустить сканирование", v -> startScanning());
-        button(layout, "Остановить сканирование", v -> {
-            getSharedPreferences("zeekr", MODE_PRIVATE).edit()
-                    .putBoolean("enabled", false).putString("status", "Сканирование остановлено").apply();
-            stopService(new Intent(this, BLEScanService.class));
-        });
-        button(layout, "Настройки Bluetooth", v -> startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)));
         setContentView(layout);
-        if (getSharedPreferences("zeekr", MODE_PRIVATE).getBoolean("enabled", true)) {
-            startScanning();
-        }
-    }
-
-    private void button(LinearLayout layout, String text, View.OnClickListener listener) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setOnClickListener(listener);
-        layout.addView(button);
-    }
-
-    private void startScanning() {
         if (!hasScanPermissions(this)) {
-            // Only permissions used by this scanner. No "request all permissions" flow.
+            // Only the permissions required by the automatic BLE service.
             requestPermissions(scanPermissions(), REQUEST_SCAN);
-            return;
         }
-        getSharedPreferences("zeekr", MODE_PRIVATE).edit().putBoolean("enabled", true).apply();
-        startForegroundService(new Intent(this, BLEScanService.class));
+    }
+
+    private void ensureScanService() {
+        if (hasScanPermissions(this)) {
+            startForegroundService(new Intent(this, BLEScanService.class));
+        }
     }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode == REQUEST_SCAN && hasScanPermissions(this)) {
-            startScanning();
+            ensureScanService();
         } else if (requestCode == REQUEST_SCAN) {
             getSharedPreferences("zeekr", MODE_PRIVATE).edit()
                     .putString("status", "Для BLE-сканирования нужно разрешение на устройства поблизости").apply();
@@ -103,6 +82,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        ensureScanService();
+        handler.removeCallbacks(refresh);
         handler.post(refresh);
     }
 

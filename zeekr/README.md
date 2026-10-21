@@ -34,7 +34,18 @@ UI instead of the notification drawer. The application does not request that opt
 
 Open Zeekr BLE and grant Nearby devices. Scanning starts automatically. The activity can then
 be removed from Recents: the service has `stopWithTask=false` and returns `START_STICKY`.
-Use the Stop button to stop intentionally. Reopen the app and press Start to resume.
+The activity is informational only: title, current service status and a short explanation.
+It contains no buttons and never stops the service. There is no saved manual enabled/disabled
+setting; the obsolete setting from previous versions is removed automatically.
+
+With Bluetooth OFF, the foreground service waits for its dynamic Bluetooth receiver, with no
+scan registrations, diagnostics or pending restart/health-check timers. Bluetooth ON restores
+the main scan and watchdog without opening the activity. START_STICKY recreation checks the
+current adapter state and follows the same automatic behavior. Reopening the UI after granting
+Nearby devices in Android Settings also ensures the service is started.
+
+An initial app launch and permission grant are required. Force-stop and reboot are outside
+START_STICKY recovery; there is no boot receiver or extra permission in this build.
 
 The only scan filter is advertised Complete/Short Local Name `Zeekr862`. The cached device name
 and a fixed MAC are never used. Every matching result sends the public action
@@ -64,7 +75,7 @@ Bluetooth OFF pauses scanning without a restart loop; ON restores the main scan,
 monitoring baseline and resumes checks.
 
 Each restart sends `nodomain.freeyourgadget.gadgetbridge.BLE_SCANNER_RESTART` with:
-- `EXTRA_RESTART_REASON`: `watchdog_timeout`, `scan_failed`, or `bluetooth_reenabled`.
+- `EXTRA_RESTART_REASON`: `watchdog_timeout`, `scan_failed`, `bluetooth_reenabled`, or `service_recovery`.
 - `EXTRA_TIMESTAMP`: Unix timestamp in milliseconds (long).
 - `EXTRA_ERROR_CODE`: Android scan error code (int), only when available.
 

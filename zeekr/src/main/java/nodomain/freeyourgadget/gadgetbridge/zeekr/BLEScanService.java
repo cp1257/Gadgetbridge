@@ -159,6 +159,10 @@ public class BLEScanService extends Service {
             }
             int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
             if (state == BluetoothAdapter.STATE_ON) {
+                if (!bluetoothOff && mainScanStarted) {
+                    return;
+                }
+                Log.i(TAG, "Bluetooth ON -> restoring scan");
                 bluetoothOff = false;
                 cancelWatchdog();
                 stopMainScan();
@@ -172,12 +176,7 @@ public class BLEScanService extends Service {
                 }
                 scheduleCheck();
             } else if (state == BluetoothAdapter.STATE_OFF || state == BluetoothAdapter.STATE_TURNING_OFF) {
-                bluetoothOff = true;
-                Log.i(TAG, "Bluetooth off: watchdog restart suppressed");
-                cancelWatchdog();
-                stopMainScan();
-                scanner = null;
-                status("Ожидание включения Bluetooth");
+                waitForBluetooth();
             }
         }
     };
@@ -185,6 +184,9 @@ public class BLEScanService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        Log.i(TAG, "Service recreated");
+        // Older versions offered a manual Stop button. That setting is obsolete.
+        getSharedPreferences("zeekr", MODE_PRIVATE).edit().remove("enabled").apply();
         if (!MainActivity.hasScanPermissions(this)) {
             status("Нет разрешения на BLE-сканирование");
             stopSelf();
@@ -219,21 +221,45 @@ public class BLEScanService extends Service {
         }
         screenReceiverRegistered = true;
         bluetoothManager = getSystemService(BluetoothManager.class);
+        bluetoothOff = !bluetoothEnabled();
         setScreenOff(!getSystemService(PowerManager.class).isInteractive());
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (!MainActivity.hasScanPermissions(this)
-                || !getSharedPreferences("zeekr", MODE_PRIVATE).getBoolean("enabled", true)) {
+        if (!MainActivity.hasScanPermissions(this)) {
             stopSelf();
             return START_NOT_STICKY;
         }
+        if (intent == null) {
+            Log.i(TAG, "START_STICKY recovery");
+        }
+        if (!bluetoothEnabled()) {
+            waitForBluetooth();
+            return START_STICKY;
+        }
+        bluetoothOff = false;
+        boolean wasScanning = mainScanStarted;
         startZeekrScan();
+        if (intent == null && !wasScanning && mainScanStarted) {
+            sendRestartEvent("service_recovery", null);
+        }
         if (!handler.hasCallbacks(watchdogCheck)) {
             scheduleCheck();
         }
         return START_STICKY;
+    }
+
+    private void waitForBluetooth() {
+        bluetoothOff = true;
+        cancelWatchdog();
+        stopMainScan();
+        scanner = null;
+        lastErrorCode = null;
+        Log.i(TAG, "Main scan stopped: Bluetooth OFF");
+        Log.i(TAG, "Bluetooth off: watchdog restart suppressed");
+        Log.i(TAG, "Waiting for Bluetooth");
+        status("Ожидание включения Bluetooth");
     }
 
     private void setScreenOff(boolean off) {
@@ -277,7 +303,11 @@ public class BLEScanService extends Service {
         }
         lastErrorCode = code;
         Log.e(TAG, "BLE scan failed: " + code);
-        status("Ошибка BLE " + code);
+        status("Перезапуск BLE-сканера");
+        if (!bluetoothEnabled()) {
+            waitForBluetooth();
+            return;
+        }
         if (watchdogEnabled()) {
             scheduleFailureRetry();
         }
@@ -308,7 +338,7 @@ public class BLEScanService extends Service {
         try {
             if (!bluetoothEnabled()) {
                 // Powered-off Bluetooth and time spent waiting for it are not a scanner timeout.
-                Log.i(TAG, "Bluetooth off: watchdog restart suppressed");
+                waitForBluetooth();
                 return;
             }
             if (scanner == null) {
@@ -376,13 +406,16 @@ public class BLEScanService extends Service {
         }
         try {
             if (!bluetoothEnabled()) {
+                waitForBluetooth();
                 return;
             }
             long now = SystemClock.elapsedRealtime();
             if (now - lastWatchdogRestart < RESTART_COOLDOWN) {
+                Log.i(TAG, "Restart suppressed by cooldown");
                 return;
             }
             lastWatchdogRestart = now;
+            status("Перезапуск BLE-сканера");
             cancelWatchdog();
             stopMainScan();
             scanner = null; // startZeekrScan obtains the adapter and scanner again.
@@ -422,8 +455,7 @@ public class BLEScanService extends Service {
         try {
             BluetoothAdapter adapter = bluetoothManager == null ? null : bluetoothManager.getAdapter();
             if (adapter == null || !adapter.isEnabled()) {
-                scanner = null;
-                status("Ожидание включения Bluetooth");
+                waitForBluetooth();
                 return;
             }
             if (scanner == null) {

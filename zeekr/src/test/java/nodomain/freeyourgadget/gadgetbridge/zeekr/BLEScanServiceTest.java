@@ -404,4 +404,148 @@ public class BLEScanServiceTest {
         assertArrayEquals(new String[]{Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT}, MainActivity.scanPermissions());
     }
+
+    private void bluetoothState(int state) {
+        BroadcastReceiver receiver = ReflectionHelpers.getField(service, "bluetoothReceiver");
+        receiver.onReceive(service, new Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
+                .putExtra(BluetoothAdapter.EXTRA_STATE, state));
+    }
+
+    private void assertNoWatchdogTimers() {
+        android.os.Handler handler = ReflectionHelpers.getField(service, "handler");
+        for (String field : new String[]{"watchdogCheck", "diagnosticEnd", "failureRetry"}) {
+            Runnable task = ReflectionHelpers.getField(service, field);
+            assertFalse(field, handler.hasCallbacks(task));
+        }
+    }
+
+    @Test
+    public void initialBluetoothOffWaitsWithoutAnyTimersAndOnRestoresWithoutActivity() {
+        BluetoothManager manager = ReflectionHelpers.getField(service, "bluetoothManager");
+        service.onDestroy();
+        Shadows.shadowOf(BluetoothAdapter.getDefaultAdapter()).setEnabled(false);
+        service = Robolectric.buildService(BLEScanService.class).create().get();
+        ReflectionHelpers.setField(service, "bluetoothManager", manager);
+        callback = ReflectionHelpers.getField(service, "scanCallback");
+        diagnostic = ReflectionHelpers.getField(service, "diagnosticCallback");
+        when(adapter.isEnabled()).thenReturn(false);
+        clearInvocations(scanner);
+        assertEquals(BLEScanService.START_STICKY, service.onStartCommand(null, 0, 1));
+        assertNoWatchdogTimers();
+        advance(3600);
+        verifyNoInteractions(scanner);
+        assertEquals("Ожидание включения Bluetooth",
+                service.getSharedPreferences("zeekr", 0).getString("status", ""));
+        assertNotNull(Shadows.shadowOf(service).getLastForegroundNotification());
+        when(adapter.isEnabled()).thenReturn(true);
+        bluetoothState(BluetoothAdapter.STATE_ON);
+        verify(scanner).startScan(anyList(), any(ScanSettings.class), same(callback));
+        assertEquals("Сканирование Zeekr862 активно",
+                service.getSharedPreferences("zeekr", 0).getString("status", ""));
+        advance(30);
+        verify(scanner).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
+    }
+
+    @Test
+    public void bluetoothOffCancelsActiveDiagnosticAndPendingFailureRecovery() {
+        start();
+        advance(30);
+        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
+        when(adapter.isEnabled()).thenReturn(false);
+        bluetoothState(BluetoothAdapter.STATE_TURNING_OFF);
+        verify(scanner).stopScan(same(callback));
+        verify(scanner).stopScan(same(diagnostic));
+        assertNoWatchdogTimers();
+        clearInvocations(scanner);
+        callback.onScanFailed(ScanCallback.SCAN_FAILED_INTERNAL_ERROR);
+        advance(3600);
+        assertNoWatchdogTimers();
+        verifyNoInteractions(scanner);
+        assertTrue(events(BLEScanService.ACTION_SCANNER_RESTART).isEmpty());
+    }
+
+    @Test
+    public void stickyRecoveryIgnoresObsoleteManualStopSetting() {
+        service.getSharedPreferences("zeekr", 0).edit().putBoolean("enabled", false).apply();
+        assertEquals(BLEScanService.START_STICKY, service.onStartCommand(null, 0, 1));
+        verify(scanner).startScan(anyList(), any(ScanSettings.class), same(callback));
+        assertEquals("service_recovery", events(BLEScanService.ACTION_SCANNER_RESTART).get(0)
+                .getStringExtra(BLEScanService.EXTRA_RESTART_REASON));
+        advance(30);
+        verify(scanner).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
+    }
+
+    @Test
+    public void repeatedBluetoothOnAndServiceStartDoNotDuplicateMainOrDiagnosticScans() {
+        start();
+        bluetoothState(BluetoothAdapter.STATE_ON);
+        bluetoothState(BluetoothAdapter.STATE_ON);
+        start();
+        advance(30);
+        start();
+        bluetoothState(BluetoothAdapter.STATE_ON);
+        verify(scanner, times(1)).startScan(anyList(), any(ScanSettings.class), same(callback));
+        verify(scanner, times(1)).startScan(isNull(), any(ScanSettings.class), same(diagnostic));
+        verify(scanner, never()).stopScan(same(callback));
+    }
+
+    private boolean containsButton(android.view.View view) {
+        if (view instanceof android.widget.Button) return true;
+        if (view instanceof android.view.ViewGroup) {
+            android.view.ViewGroup group = (android.view.ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                if (containsButton(group.getChildAt(i))) return true;
+            }
+        }
+        return false;
+    }
+
+    @Test
+    public void informationalActivityStartsServiceAutomaticallyAndClosingItDoesNotStopScan() {
+        start();
+        org.robolectric.android.controller.ActivityController<MainActivity> controller =
+                Robolectric.buildActivity(MainActivity.class).create().start().resume().visible();
+        MainActivity activity = controller.get();
+        assertFalse(containsButton(activity.getWindow().getDecorView()));
+        Intent started = Shadows.shadowOf(activity).getNextStartedService();
+        assertNotNull(started);
+        assertEquals(BLEScanService.class.getName(), started.getComponent().getClassName());
+        clearInvocations(scanner);
+        controller.pause().stop().destroy();
+        assertNull(Shadows.shadowOf(RuntimeEnvironment.getApplication()).getNextStoppedService());
+        verifyNoInteractions(scanner);
+        advance(30);
+        diagnostic.onScanResult(1, advertisement("Zeekr862", "11:12:13:14:15:16", -70));
+        assertEquals(1, events().size());
+        verify(scanner, never()).stopScan(same(callback));
+    }
+
+    @Test
+    public void permissionGrantStartsServiceWithoutButtonAndDenialDoesNotStartIt() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).denyPermissions(MainActivity.scanPermissions());
+        org.robolectric.android.controller.ActivityController<MainActivity> controller =
+                Robolectric.buildActivity(MainActivity.class).create().start().resume();
+        MainActivity activity = controller.get();
+        assertArrayEquals(MainActivity.scanPermissions(),
+                Shadows.shadowOf(activity).getLastRequestedPermission().requestedPermissions);
+        assertNull(Shadows.shadowOf(activity).getNextStartedService());
+        activity.onRequestPermissionsResult(1, MainActivity.scanPermissions(), new int[]{-1, -1});
+        assertNull(Shadows.shadowOf(activity).getNextStartedService());
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(MainActivity.scanPermissions());
+        activity.onRequestPermissionsResult(1, MainActivity.scanPermissions(), new int[]{0, 0});
+        assertNotNull(Shadows.shadowOf(activity).getNextStartedService());
+        controller.pause().stop().destroy();
+    }
+
+    @Test
+    public void returningAfterGrantInAndroidSettingsAutomaticallyStartsService() {
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).denyPermissions(MainActivity.scanPermissions());
+        org.robolectric.android.controller.ActivityController<MainActivity> controller =
+                Robolectric.buildActivity(MainActivity.class).create().start().resume().pause();
+        MainActivity activity = controller.get();
+        Shadows.shadowOf(RuntimeEnvironment.getApplication()).grantPermissions(MainActivity.scanPermissions());
+        controller.resume();
+        assertNotNull(Shadows.shadowOf(activity).getNextStartedService());
+        controller.pause().stop().destroy();
+    }
 }
